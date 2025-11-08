@@ -52,6 +52,7 @@ from .jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from .jit.gemm import gen_trtllm_gen_gemm_module
 from .jit.gemm import gen_tgv_gemm_sm10x_module
 from .jit.gemm import gen_deepgemm_sm100_module
+from .jit.gemm.fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
 
 
 CUDNN_AVAILABLE = False
@@ -2882,5 +2883,122 @@ def batch_deepgemm_fp8_nt_groupwise(
     m_grouped_fp8_gemm_nt_masked(
         (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk
     )
+
+    return out
+
+
+@functools.cache
+def get_fp8_blockscale_gemm_runner():
+    """Get the cached FP8 block scale GEMM runner module for SM90."""
+    module = gen_fp8_blockscale_gemm_sm90_module().build_and_load()
+    return module.init()
+
+
+def fp8_blockscale_gemm_swapab(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Perform FP8 block-scaled GEMM with automatic swapAB optimization.
+
+    This function automatically selects between normal and swapAB kernel based on
+    the M dimension (shape_m). For small M (< 32), it uses the swapAB kernel for
+    better performance.
+
+    The computation is: output = input @ weight.T with per-block FP8 quantization
+    and scaling.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input activation tensor of shape (M, K). Can be:
+        - FP8 (torch.float8_e4m3fn) with input_scale required
+        - BF16 (torch.bfloat16) for internal quantization
+    weight : torch.Tensor
+        Weight tensor of shape (N, K). Can be:
+        - FP8 (torch.float8_e4m3fn) with weight_scale required
+        - BF16 (torch.bfloat16) for internal quantization
+    input_scale : torch.Tensor, optional
+        Per-token or per-block scaling factors for input.
+        Required if input is FP8. Shape depends on block size.
+    weight_scale : torch.Tensor, optional
+        Per-block scaling factors for weight.
+        Required if weight is FP8. Shape depends on block size.
+    out : torch.Tensor, optional
+        Output tensor of shape (M, N). If None, will be allocated.
+    out_dtype : torch.dtype, optional
+        Output data type. Default is torch.bfloat16.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape (M, N) with dtype `out_dtype`.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer.gemm import fp8_blockscale_gemm_swapab
+    >>>
+    >>> M, N, K = 16, 4096, 4096  # Small M for swapAB
+    >>> device = "cuda"
+    >>>
+    >>> # FP8 inputs (pre-quantized)
+    >>> input_fp8 = torch.randn(M, K, device=device, dtype=torch.float8_e4m3fn)
+    >>> weight_fp8 = torch.randn(N, K, device=device, dtype=torch.float8_e4m3fn)
+    >>> input_scale = torch.randn(M, K // 128, device=device, dtype=torch.float32)
+    >>> weight_scale = torch.randn(N, K // 128, device=device, dtype=torch.float32)
+    >>>
+    >>> # Run GEMM with automatic swapAB selection
+    >>> output = fp8_blockscale_gemm_swapab(
+    ...     input_fp8, weight_fp8, input_scale, weight_scale
+    ... )
+    >>> print(output.shape)  # torch.Size([16, 4096])
+    >>>
+    >>> # BF16 inputs (internal quantization)
+    >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
+    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_bf16)
+    >>> print(output.shape)  # torch.Size([16, 4096])
+
+    Notes
+    -----
+    - This function requires NVIDIA Hopper (SM90) architecture and CUDA 12.8+
+    - SwapAB kernel is automatically used when M < 32 (threshold)
+    - For FP8 inputs, scaling factors must be provided
+    - For BF16 inputs, quantization and scaling happen internally
+    - The function uses DeepGEMM backend with JIT compilation
+    - All input tensors must be on the same CUDA device
+    """
+    if not _match_sm_version(input.device, ["90", "90a"]):
+        raise ValueError(
+            "fp8_blockscale_gemm_swapab is only supported on SM90 (Hopper)."
+        )
+
+    # Get dimensions
+    M, K = input.shape
+    N = weight.shape[0]
+
+    # Allocate output if needed
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(M, N, dtype=out_dtype, device=input.device)
+
+    # Get the runner
+    runner = get_fp8_blockscale_gemm_runner()
+
+    # Allocate workspace if needed
+    workspace_size = runner.get_workspace_size(M, N, K)
+    if workspace_size > 0:
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=input.device
+        )
+        runner.configure_workspace(workspace)
+
+    # Run GEMM (dispatch happens inside based on M threshold)
+    runner.gemm(input, weight, out, input_scale, weight_scale)
 
     return out
