@@ -4,7 +4,6 @@ from .. import env as jit_env
 from ..core import (
     JitSpec,
     gen_jit_spec,
-    current_compilation_context,
     sm90a_nvcc_flags,
 )
 from ..cpp_ext import is_cuda_version_at_least
@@ -24,7 +23,7 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "gemm/fp8_blockscale_gemm_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "fp8_blockscale_gemm_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
@@ -33,7 +32,7 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
-        extra_ldflags=["-lnvrtc"],
+        extra_ldflags=["-lnvrtc", "-lcuda"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
