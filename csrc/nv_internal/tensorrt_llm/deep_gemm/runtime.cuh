@@ -31,8 +31,13 @@
 namespace deep_gemm::jit {
 
 static bool kJitDebugging = []() {
-  char const* env_var = getenv("TRTLLM_DG_JIT_DEBUG");
-  return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+  // char const* env_var = getenv("TRTLLM_DG_JIT_USE_NVCC");
+  // return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+  // always use nvcc
+  // TODO: Enable nvrtc -- need these headers:
+  // [TensorRT-LLM][INFO] Compilation log:
+  // kernel.cu(16): catastrophic error: cannot open source file "cuda_bf16.h"
+  return true;
 }();
 
 static bool kJitUseNvcc = []() {
