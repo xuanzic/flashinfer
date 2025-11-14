@@ -1165,7 +1165,15 @@ __global__ void convert_kernel(OutputType* output, InputType const* const input,
 static int kNumDeviceSMs = -1;
 static bool kDeepGemmEnabled = []() -> bool {
   char const* env_var = std::getenv("TRTLLM_DG_ENABLED");
-  return deep_gemm::jit::getGlobalCompiler().isValid() && (!env_var || std::string(env_var) != "0");
+  bool jit_valid = deep_gemm::jit::getGlobalCompiler().isValid();
+  bool enabled = jit_valid && (!env_var || std::string(env_var) != "0");
+  
+  // Debug: Print DeepGEMM status
+  printf("[DeepGEMM] JIT compiler valid: %s\n", jit_valid ? "YES" : "NO");
+  printf("[DeepGEMM] TRTLLM_DG_ENABLED: %s\n", env_var ? env_var : "(not set)");
+  printf("[DeepGEMM] Enabled: %s\n", enabled ? "YES" : "NO");
+  
+  return enabled;
 }();
 
 void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
@@ -1340,29 +1348,48 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
   constexpr uint32_t num_problems = 1;
 
   uint32_t m_threshold = 32;
+  
+  // Debug: Show dispatch decision
+  printf("[gemm_dispatch] M=%u, N=%u, K=%u, threshold=%u\n", shape_m, shape_n, shape_k, m_threshold);
+  
   if (shape_m >= m_threshold) {
+    printf("[gemm_dispatch] Using NORMAL GEMM (M >= %u)\n", m_threshold);
+    
     // Select the best configuration based on shape dimensions
     auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size] =
         deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems,
                                              num_device_sms);
 
+    printf("[gemm_dispatch] Config: block_m=%u, block_n=%u, stages=%u\n", 
+           best_block_m, best_block_n, best_num_stages);
+
     auto runtime = deep_gemm::jit::getGlobalCompiler().build(
         shape_n, shape_k, best_block_m, best_block_n, block_k, num_problems, best_num_stages,
         best_num_tma_multicast, deep_gemm::GemmType::Normal);
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    
+    printf("[gemm_dispatch] Calling deep_gemm::runGemm\n");
     deep_gemm::runGemm(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m,
                        shape_n, shape_k, best_block_m, best_block_n, block_k, num_problems,
                        best_num_tma_multicast, deep_gemm::GemmType::Normal,
                        static_cast<int*>(nullptr), stream, num_device_sms,
                        static_cast<uint32_t>(best_smem_size));
   } else {
+    printf("[gemm_dispatch] Using SWAPAB GEMM (M < %u) *** SWAPAB PATH ***\n", m_threshold);
+    
     auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size] =
         deep_gemm::jit::get_best_gemm_config(shape_n, shape_m, shape_k, num_problems,
                                              num_device_sms, false, true);
+    
+    printf("[gemm_dispatch] Config: block_m=%u, block_n=%u, stages=%u\n", 
+           best_block_m, best_block_n, best_num_stages);
+
     auto runtime = deep_gemm::jit::getGlobalCompiler().build(
         shape_n, shape_k, best_block_m, best_block_n, block_k, num_problems, best_num_stages,
         best_num_tma_multicast, deep_gemm::GemmType::Normal, true);
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    
+    printf("[gemm_dispatch] Calling deep_gemm::runGemmSwapAB\n");
     deep_gemm::runGemmSwapAB(kernel, mat_b, ld_b, mat_a, ld_a, mat_d, ld_d, scales_b, scales_a,
                              shape_n, shape_m, shape_k, best_block_m, best_block_n, block_k,
                              num_problems, best_num_tma_multicast, deep_gemm::GemmType::Normal,
@@ -1414,16 +1441,28 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
   if (shape_m == 0) {
     return;
   }
+  
+  // Debug: Print entry to fp8_gemm_run
+  printf("\n[fp8_gemm_run] Called with M=%u, N=%u, K=%u\n", shape_m, shape_n, shape_k);
+  
 #ifndef PLACEHOLDER_KERNELS
   int arch = tensorrt_llm::common::getSMVersion();
+  printf("[fp8_gemm_run] SM version: %d\n", arch);
+  
   if (arch == 89) {
+    printf("[fp8_gemm_run] Using SM89 dispatch (Ada)\n");
     gemm_dispatch_sm89(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
     return;
   }
+  
+  printf("[fp8_gemm_run] kDeepGemmEnabled = %s\n", kDeepGemmEnabled ? "TRUE" : "FALSE");
+  
   if (kDeepGemmEnabled) {
+    printf("[fp8_gemm_run] Using DeepGEMM dispatch (NEW)\n");
     gemm_dispatch(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
                   shape_k, stream);
   } else {
+    printf("[fp8_gemm_run] Using OLD dispatch (fallback)\n");
     gemm_dispatch_old(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b,
                       static_cast<int>(shape_m), static_cast<int>(shape_n),
                       static_cast<int>(shape_k), stream);
