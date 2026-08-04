@@ -1889,7 +1889,8 @@ def nvfp4_kv_dequantize(
         Global scale factor of shape ``[1]`` with dtype ``float32``, on the
         same CUDA device as ``fp4_data``.
     output_dtype : torch.dtype
-        Output dtype, either ``torch.bfloat16`` or ``torch.float16``.
+        Output dtype: ``torch.bfloat16``, ``torch.float16``, or
+        ``torch.float8_e4m3fn``.
 
     Returns
     -------
@@ -1901,6 +1902,15 @@ def nvfp4_kv_dequantize(
     K = fp4_data.size(1) * 2
     if K % _NVFP4_BLOCK_SIZE != 0:
         raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
+    if output_dtype not in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+    ):
+        raise ValueError(
+            "output_dtype must be torch.bfloat16, torch.float16, or "
+            f"torch.float8_e4m3fn, got {output_dtype}"
+        )
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
     get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
         fp4_data, block_scales, global_scale, output

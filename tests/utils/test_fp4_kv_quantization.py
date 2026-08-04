@@ -64,6 +64,11 @@ def reference_dequant(fp4_data, block_scales, global_scale_val, output_dtype):
     scale_expanded = scale_floats.unsqueeze(-1).expand(M, K // 16, 16).reshape(M, K)
 
     output = values * scale_expanded * global_scale_val
+    if output_dtype == torch.float8_e4m3fn:
+        # CUDA's FP8 conversion uses saturate-to-finite semantics.
+        fp8_max = torch.finfo(output_dtype).max
+        output = output.clamp(min=-fp8_max, max=fp8_max)
+        return output.to(fp4_data.device).to(output_dtype)
     return output.to(output_dtype).to(fp4_data.device)
 
 
@@ -72,12 +77,13 @@ def get_compute_capability():
     return props.major * 10 + props.minor
 
 
-SHAPES = [(128, 64), (256, 128), (1, 32), (2048, 2048)]
+SHAPES = [(128, 64), (256, 128), (128, 512), (1, 32), (2048, 2048)]
 DTYPES = [torch.bfloat16, torch.float16]
+DEQUANT_DTYPES = [*DTYPES, torch.float8_e4m3fn]
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DEQUANT_DTYPES)
 def test_nvfp4_kv_dequant(shape, dtype):
     """Test dequantization kernel against PyTorch reference."""
     cc = get_compute_capability()
@@ -106,6 +112,50 @@ def test_nvfp4_kv_dequant(shape, dtype):
     ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
 
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
+
+
+def test_nvfp4_kv_dequant_fp8_rounds_directly_from_fp32():
+    """Ensure FP8 output does not introduce an intermediate BF16 rounding."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    M, K = 128, 512
+    torch.manual_seed(123)
+    fp4_data = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
+    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
+    global_scale_val = 0.5
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
+
+    direct_fp8 = flashinfer.nvfp4_kv_dequantize(
+        fp4_data,
+        block_scales,
+        global_scale,
+        output_dtype=torch.float8_e4m3fn,
+    )
+    ref_fp8 = reference_dequant(
+        fp4_data, block_scales, global_scale_val, torch.float8_e4m3fn
+    )
+    via_bf16 = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale, output_dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+
+    torch.testing.assert_close(direct_fp8.float(), ref_fp8.float(), atol=0, rtol=0)
+    assert torch.any(direct_fp8.view(torch.uint8) != via_bf16.view(torch.uint8))
+
+
+def test_nvfp4_kv_dequant_rejects_unsupported_output_dtype():
+    fp4_data = torch.empty((1, 16), dtype=torch.uint8, device="cuda")
+    block_scales = torch.empty((1, 2), dtype=torch.uint8, device="cuda")
+    global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="output_dtype must be"):
+        flashinfer.nvfp4_kv_dequantize(
+            fp4_data,
+            block_scales,
+            global_scale,
+            output_dtype=torch.float32,
+        )
 
 
 @pytest.mark.parametrize("shape", SHAPES)
