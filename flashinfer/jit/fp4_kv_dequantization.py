@@ -26,5 +26,9 @@ def gen_fp4_kv_dequantization_module() -> JitSpec:
         "fp4_kv_dequant",
         [jit_env.FLASHINFER_CSRC_DIR / "fp4_kv_dequantization.cu"],
         extra_cuda_cflags=nvcc_flags
-        + ["-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
+        + [
+            "-DFLASHINFER_ENABLE_BF16",
+            "-DFLASHINFER_ENABLE_F16",
+            "-DFLASHINFER_ENABLE_FP8_E4M3",
+        ],
     )

@@ -29,6 +29,19 @@
 // Number of elements per block scale group
 constexpr int NVFP4_BLOCK_SIZE = 16;
 
+#define DISPATCH_NVFP4_DEQUANT_OUTPUT_DTYPE(dlpack_dtype, c_type, ...)                   \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 // E2M1 lookup table
 __device__ __constant__ float E2M1_LUT[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,
                                               4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
@@ -122,6 +135,9 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
 
         *reinterpret_cast<half2*>(&row_output[col]) = h2_0;
         *reinterpret_cast<half2*>(&row_output[col + 2]) = h2_1;
+      } else if constexpr (std::is_same_v<OutType, __nv_fp8_e4m3>) {
+        *reinterpret_cast<__nv_fp8x2_e4m3*>(&row_output[col]) = __nv_fp8x2_e4m3(out0);
+        *reinterpret_cast<__nv_fp8x2_e4m3*>(&row_output[col + 2]) = __nv_fp8x2_e4m3(out1);
       }
     }
   }
@@ -181,6 +197,9 @@ __global__ void nvfp4_paged_dequant_kernel(
           __float22bfloat162_rn(make_float2(out0, out1));
     } else if constexpr (std::is_same_v<OutType, half>) {
       *reinterpret_cast<half2*>(&row_output[col]) = __float22half2_rn(make_float2(out0, out1));
+    } else if constexpr (std::is_same_v<OutType, __nv_fp8_e4m3>) {
+      *reinterpret_cast<__nv_fp8x2_e4m3*>(&row_output[col]) =
+          __nv_fp8x2_e4m3(make_float2(out0, out1));
     }
   }
 }
@@ -200,6 +219,9 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   TVM_FFI_ICHECK(output.ndim() == 2) << "output must be 2D";
   TVM_FFI_ICHECK(output.size(0) == M) << "output row count mismatch";
   TVM_FFI_ICHECK(output.size(1) == K) << "output column count mismatch";
+  TVM_FFI_ICHECK(output.dtype() == dl_float16 || output.dtype() == dl_bfloat16 ||
+                 output.dtype() == dl_float8_e4m3fn)
+      << "output must have dtype float16, bfloat16, or float8_e4m3fn";
   TVM_FFI_ICHECK(block_scales.size(0) == M) << "block_scales row count mismatch";
   TVM_FFI_ICHECK(K % NVFP4_BLOCK_SIZE == 0)
       << "K dimension must be divisible by " << NVFP4_BLOCK_SIZE;
@@ -224,7 +246,7 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   constexpr int ELTS_PER_THREAD = 16;
   const size_t smem_size = sizeof(float) + static_cast<size_t>(K / NVFP4_BLOCK_SIZE);
 
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output.dtype(), c_type, [&] {
+  DISPATCH_NVFP4_DEQUANT_OUTPUT_DTYPE(output.dtype(), c_type, [&] {
     nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, ELTS_PER_THREAD>
         <<<grid, block, smem_size, stream>>>(static_cast<const uint8_t*>(fp4_data.data_ptr()),
                                              static_cast<const uint8_t*>(block_scales.data_ptr()),
@@ -272,6 +294,9 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   TVM_FFI_ICHECK(v_global_scale.numel() == 1) << "v_global_scale must be a scalar tensor";
   TVM_FFI_ICHECK(output_k.dtype() == output_v.dtype())
       << "output_k and output_v must have the same dtype";
+  TVM_FFI_ICHECK(output_k.dtype() == dl_float16 || output_k.dtype() == dl_bfloat16 ||
+                 output_k.dtype() == dl_float8_e4m3fn)
+      << "output_k and output_v must have dtype float16, bfloat16, or float8_e4m3fn";
 
   const int batch_size = output_k.size(0);
   const int max_seq_len = output_k.size(1);
@@ -385,7 +410,7 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   dim3 grid(batch_size * max_seq_len * num_heads);
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_tables.dtype(), id_type, [&] {
-    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_k.dtype(), out_type, [&] {
+    DISPATCH_NVFP4_DEQUANT_OUTPUT_DTYPE(output_k.dtype(), out_type, [&] {
       nvfp4_paged_dequant_kernel<out_type, id_type><<<grid, k_block, 0, stream>>>(
           static_cast<const uint8_t*>(paged_k_cache.data_ptr()),
           static_cast<const uint8_t*>(k_scales.data_ptr()),

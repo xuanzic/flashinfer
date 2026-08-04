@@ -2078,7 +2078,8 @@ def nvfp4_kv_dequantize(
         Global scale factor of shape ``[1]`` with dtype ``float32``, on the
         same CUDA device as ``fp4_data``.
     output_dtype : torch.dtype
-        Output dtype, either ``torch.bfloat16`` or ``torch.float16``.
+        Output dtype: ``torch.bfloat16``, ``torch.float16``, or
+        ``torch.float8_e4m3fn``.
 
     Returns
     -------
@@ -2090,6 +2091,15 @@ def nvfp4_kv_dequantize(
     K = fp4_data.size(1) * 2
     if K % _NVFP4_BLOCK_SIZE != 0:
         raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
+    if output_dtype not in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+    ):
+        raise ValueError(
+            "output_dtype must be torch.bfloat16, torch.float16, or "
+            f"torch.float8_e4m3fn, got {output_dtype}"
+        )
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
     get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
         fp4_data, block_scales, global_scale, output
@@ -2145,7 +2155,7 @@ def nvfp4_kv_dequantize_paged(
     output_k, output_v : torch.Tensor
         Caller-owned output tensors in ``[batch, max_seq_len, num_heads,
         head_dim]`` layout. Each must be contiguous and have dtype
-        ``torch.float16`` or ``torch.bfloat16``.
+        ``torch.float16``, ``torch.bfloat16``, or ``torch.float8_e4m3fn``.
     kv_layout : str
         Layout of the paged input cache, either ``"NHD"`` or ``"HND"``.
 
@@ -2171,9 +2181,14 @@ def nvfp4_kv_dequantize_paged(
         raise ValueError("k_scale and v_scale must be scalar tensors")
     if output_k.dtype != output_v.dtype:
         raise ValueError("output_k and output_v must have the same dtype")
-    if output_k.dtype not in (torch.float16, torch.bfloat16):
+    if output_k.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ):
         raise ValueError(
-            f"output dtype must be torch.float16 or torch.bfloat16, got {output_k.dtype}"
+            "output dtype must be torch.float16, torch.bfloat16, or "
+            f"torch.float8_e4m3fn, got {output_k.dtype}"
         )
     if output_k.ndim != 4 or output_v.ndim != 4:
         raise ValueError("output_k and output_v must be 4D tensors")
