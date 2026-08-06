@@ -2200,6 +2200,8 @@ def fmha_decode_launch(
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
+    k_sf_page_stride: Int64 = 0,
+    v_sf_page_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -2427,12 +2429,27 @@ def fmha_decode_launch(
         sf_inner = sf_per_token * sf_r
         sf_tokens_outer = cfg.num_tokens_per_page // sf_r
         sf_page_elems = Int32(sf_per_token * cfg.num_tokens_per_page)
-        sf_layout = cute.make_layout(
-            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
-            stride=(1, Int32(sf_inner), sf_page_elems, sf_page_elems * h_k),
+        compact_sf_page_stride = sf_page_elems * h_k
+        k_sf_tma_page_stride = (
+            k_sf_page_stride
+            if cutlass.const_expr(use_native_paged_kv)
+            else compact_sf_page_stride
         )
-        k_sf_tma = cute.make_tensor(k_sf_iter, sf_layout)
-        v_sf_tma = cute.make_tensor(v_sf_iter, sf_layout)
+        v_sf_tma_page_stride = (
+            v_sf_page_stride
+            if cutlass.const_expr(use_native_paged_kv)
+            else compact_sf_page_stride
+        )
+        k_sf_layout = cute.make_layout(
+            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
+            stride=(1, Int32(sf_inner), sf_page_elems, k_sf_tma_page_stride),
+        )
+        v_sf_layout = cute.make_layout(
+            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
+            stride=(1, Int32(sf_inner), sf_page_elems, v_sf_tma_page_stride),
+        )
+        k_sf_tma = cute.make_tensor(k_sf_iter, k_sf_layout)
+        v_sf_tma = cute.make_tensor(v_sf_iter, v_sf_layout)
         tma_desc_k_sf = cuda.create_tensor_map_tiled_from_view(
             k_sf_tma,
             box_dims=(sf_inner, sf_tokens_outer, 1, 1),

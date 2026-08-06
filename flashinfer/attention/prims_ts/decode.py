@@ -181,6 +181,8 @@ class _DecodeRuntime:
     num_physical_pages: int
     k_page_stride: int
     v_page_stride: int
+    k_sf_page_stride: int
+    v_sf_page_stride: int
     bmm1_scale: float
     bmm2_scale: float
 
@@ -982,7 +984,7 @@ def _normalize_paged_kv_scale_factors(
     *,
     k_cache: torch.Tensor,
     logical_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     """Validate NVFP4 scale tensors or create homogeneous-mode placeholders."""
 
     if k_cache.dtype != torch.uint8:
@@ -991,7 +993,7 @@ def _normalize_paged_kv_scale_factors(
                 "kv_scale_factors are accepted only with packed NVFP4 torch.uint8 K/V"
             )
         placeholder = k_cache[0, 0, 0, :1].view(torch.uint8)[:1]
-        return placeholder, placeholder
+        return placeholder, placeholder, 0, 0
     if kv_scale_factors is None:
         raise ValueError(
             "packed NVFP4 torch.uint8 K/V requires kv_scale_factors=(K_SF, V_SF)"
@@ -1004,6 +1006,7 @@ def _normalize_paged_kv_scale_factors(
     ):
         raise TypeError("kv_scale_factors tuple members must be torch.Tensor")
     expected_shape = (*k_cache.shape[:-1], logical_head_dim // 16)
+    page_strides = []
     for scale, name in (
         (k_sf_cache, "K scale factors"),
         (v_sf_cache, "V scale factors"),
@@ -1018,13 +1021,13 @@ def _normalize_paged_kv_scale_factors(
             )
         if scale.device != k_cache.device:
             raise ValueError(f"{name} must be on {k_cache.device}, got {scale.device}")
-        _validate_exact_compact_strides(
-            scale,
-            name,
-            "[pages, Hkv, page_size, D/16]",
-        )
-        _validate_16byte_alignment(scale, name)
-    return k_sf_cache, v_sf_cache
+        # vLLM stores packed data and scales in one allocation per physical
+        # page. The scale view is compact within a page but its outer stride
+        # spans the packed data and can therefore exceed the scale page size.
+        # Preserve that zero-copy view and pass its runtime page stride to the
+        # SF tensor maps, exactly as the packed K/V path already does.
+        page_strides.append(_validate_hnd_inner_strides(scale, name))
+    return k_sf_cache, v_sf_cache, page_strides[0], page_strides[1]
 
 
 def _validate_paged_kv_row_metadata(
@@ -1442,6 +1445,8 @@ def _get_compiled_decode(
         num_physical_kv_pages: cutlass.Int64,
         k_page_stride: cutlass.Int64,
         v_page_stride: cutlass.Int64,
+        k_sf_page_stride: cutlass.Int64,
+        v_sf_page_stride: cutlass.Int64,
         bmm1_scale: cutlass.Float32,
         bmm2_scale: cutlass.Float32,
         stream: cuda_drv.CUstream,
@@ -1504,6 +1509,8 @@ def _get_compiled_decode(
             num_physical_kv_pages,
             k_page_stride,
             v_page_stride,
+            k_sf_page_stride,
+            v_sf_page_stride,
             static_full_split_prefix,
             static_native_uniform_kv,
         )
@@ -1564,6 +1571,8 @@ def _get_compiled_decode(
     logical_pages = cute.sym_int()
     k_outer_stride = cute.sym_int64(divisibility=1)
     v_outer_stride = cute.sym_int64(divisibility=1)
+    k_sf_outer_stride = cute.sym_int64(divisibility=1)
+    v_sf_outer_stride = cute.sym_int64(divisibility=1)
     total_q_tokens = cute.sym_int()
     q_shape = (
         (total_q_tokens, num_qo_heads, head_dim)
@@ -1639,8 +1648,23 @@ def _get_compiled_decode(
     attention_sinks_fake = fake_compact(Float32, (1,), 4)
     if kv_dtype == cutlass.Float4E2M1FN:
         sf_shape = (physical_pages, num_kv_heads, page_size, head_dim // 16)
-        k_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
-        v_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
+        sf_inner_strides = (
+            page_size * (head_dim // 16),
+            head_dim // 16,
+            1,
+        )
+        k_sf_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float8E4M3FN,
+            sf_shape,
+            stride=(k_sf_outer_stride, *sf_inner_strides),
+            assumed_align=16,
+        )
+        v_sf_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float8E4M3FN,
+            sf_shape,
+            stride=(v_sf_outer_stride, *sf_inner_strides),
+            assumed_align=16,
+        )
     else:
         k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
         v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
@@ -1686,6 +1710,8 @@ def _get_compiled_decode(
                 partial_stats_fake,
                 counter_fake,
                 attention_sinks_fake,
+                Int64(1),
+                Int64(1),
                 Int64(1),
                 Int64(1),
                 Int64(1),
@@ -1915,7 +1941,12 @@ def _prepare_decode_runtime(
         raise ValueError(
             f"K/V dtype must match the launch ({kv_dtype}), got {k_cache.dtype}"
         )
-    k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
+    (
+        k_sf_cache,
+        v_sf_cache,
+        k_sf_page_stride,
+        v_sf_page_stride,
+    ) = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
         k_cache=k_cache,
         logical_head_dim=head_dim,
@@ -1953,6 +1984,8 @@ def _prepare_decode_runtime(
         num_physical_pages=num_physical_pages,
         k_page_stride=k_page_stride,
         v_page_stride=v_page_stride,
+        k_sf_page_stride=k_sf_page_stride,
+        v_sf_page_stride=v_sf_page_stride,
         bmm1_scale=effective_bmm1_scale,
         bmm2_scale=effective_bmm2_scale,
     )
@@ -2016,6 +2049,8 @@ def _launch_decode(
         runtime.num_physical_pages,
         runtime.k_page_stride,
         runtime.v_page_stride,
+        runtime.k_sf_page_stride,
+        runtime.v_sf_page_stride,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
     )
