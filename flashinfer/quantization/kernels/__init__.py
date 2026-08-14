@@ -56,6 +56,10 @@ _LAZY_EXPORTS = {
     "NVFP4QuantizeSwizzledKernel": ".nvfp4_quantize",
     "nvfp4_quantize_cute_dsl": ".nvfp4_quantize",
     "nvfp4_quantize_per_token_cute_dsl": ".nvfp4_quantize",
+    "NVFP4DequantizeQmul4LinearKernel": ".nvfp4_dequantize",
+    "NVFP4ActivePageMaterializeQmul4Kernel": ".nvfp4_dequantize",
+    "nvfp4_kv_dequantize_qmul4": ".nvfp4_dequantize",
+    "nvfp4_kv_materialize_active_pages_qmul4": ".nvfp4_dequantize",
 }
 
 __all__ = list(_LAZY_EXPORTS)
