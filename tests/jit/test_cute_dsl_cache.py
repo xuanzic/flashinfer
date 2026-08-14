@@ -233,3 +233,84 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
     )
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+# ---------------------------------------------------------------------------
+# prims+TS decode cache adopter
+# ---------------------------------------------------------------------------
+
+from flashinfer.attention.prims_ts.decode import (  # noqa: E402
+    _decode_kernel_disk_name,
+    _get_compiled_decode,
+)
+
+# Device identity itself is not codegen. The module key carries the target
+# architecture, while max_active_clusters captures device-dependent policy.
+PRIMS_TS_DECODE_NON_CODEGEN_PARAMS = {"device_index"}
+
+PRIMS_TS_DECODE_NAME_BASELINE = {
+    "variant": "main",
+    "batch_size": 1,
+    "num_qo_heads": 32,
+    "num_kv_heads": 4,
+    "head_dim": 512,
+    "page_size": 64,
+    "max_kv_len": 4096,
+    "seq_len_q": 1,
+    "q_dtype_key": "bfloat16",
+    "kv_dtype_key": "float4_e2m1fn",
+    "output_dtype_key": "bfloat16",
+    "kv_layout": "HND",
+    "mask_type": "dense",
+    "use_packed_q": False,
+    "window_left": -1,
+    "kv_prefix_mode": "dynamic",
+    "kv_lengths_mode": "dynamic",
+    "max_active_clusters": 148,
+}
+PRIMS_TS_DECODE_NAME_PERTURBED = {
+    "variant": "reducer",
+    "batch_size": 4,
+    "num_qo_heads": 16,
+    "num_kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 32,
+    "max_kv_len": 8192,
+    "seq_len_q": 2,
+    "q_dtype_key": "float8_e4m3fn",
+    "kv_dtype_key": "float8_e4m3fn",
+    "output_dtype_key": "float8_e4m3fn",
+    "kv_layout": "NHD",
+    "mask_type": "causal",
+    "use_packed_q": True,
+    "window_left": 1023,
+    "kv_prefix_mode": "planned_full",
+    "kv_lengths_mode": "planned_uniform_max",
+    "max_active_clusters": 132,
+}
+
+
+def test_prims_ts_decode_kernel_name_signature_covers_codegen_params():
+    getter_params = set(inspect.signature(_get_compiled_decode).parameters)
+    name_params = set(inspect.signature(_decode_kernel_disk_name).parameters)
+    missing = (
+        getter_params - name_params - PRIMS_TS_DECODE_NON_CODEGEN_PARAMS
+    )
+    assert not missing, (
+        f"_get_compiled_decode has codegen parameter(s) {sorted(missing)} that "
+        "_decode_kernel_disk_name cannot encode"
+    )
+
+
+@pytest.mark.parametrize("param", sorted(PRIMS_TS_DECODE_NAME_BASELINE))
+def test_prims_ts_decode_kernel_name_varies_with_every_argument(param):
+    baseline_name = _decode_kernel_disk_name(**PRIMS_TS_DECODE_NAME_BASELINE)
+    kwargs = dict(PRIMS_TS_DECODE_NAME_BASELINE)
+    kwargs[param] = PRIMS_TS_DECODE_NAME_PERTURBED[param]
+    perturbed_name = _decode_kernel_disk_name(**kwargs)
+    assert perturbed_name != baseline_name, (
+        f"_decode_kernel_disk_name ignores argument {param!r}: two different "
+        "kernel specializations would collide on one artifact"
+    )
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name

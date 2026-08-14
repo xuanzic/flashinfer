@@ -17,8 +17,10 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 import functools
+import hashlib
 import math
 import numbers
+from pathlib import Path
 import struct
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
@@ -58,6 +60,7 @@ _SUPPORTED_INPUT_DTYPES = (
 )
 _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+_CUTE_DSL_DECODE_MODULE = "prims_ts_decode"
 _WORKSPACE_ALIGNMENT = 256
 _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
 
@@ -103,6 +106,66 @@ class _DecodeLaunchSpec:
     max_active_clusters: int
     policy: tuple[tuple[str, object], ...]
     scratch_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+
+
+@functools.cache
+def _decode_kernel_source_files() -> tuple[str, ...]:
+    """Sources that invalidate persisted prims+TS decode specializations."""
+
+    prims_ts_root = Path(__file__).resolve().parent
+    return tuple(str(path) for path in sorted(prims_ts_root.rglob("*.py")))
+
+
+def _decode_kernel_disk_name(
+    variant: Literal["main", "reducer"],
+    batch_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_kv_len: int,
+    seq_len_q: int,
+    q_dtype_key: str,
+    kv_dtype_key: str,
+    output_dtype_key: str,
+    kv_layout: str,
+    mask_type: str,
+    use_packed_q: bool,
+    window_left: int,
+    kv_prefix_mode: Literal["dynamic", "planned_full"],
+    kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
+    max_active_clusters: int,
+) -> str:
+    """Return a symbol-safe name covering every decode codegen parameter.
+
+    The target architecture and CuTeDSL version are part of the surrounding
+    :class:`JitSpecCuteDsl` module key. ``device_index`` is deliberately not
+    included: device-dependent policy is represented by
+    ``max_active_clusters`` and the remaining semantic compile arguments.
+    """
+
+    codegen_key = (
+        variant,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_kv_len,
+        seq_len_q,
+        q_dtype_key,
+        kv_dtype_key,
+        output_dtype_key,
+        kv_layout,
+        mask_type,
+        use_packed_q,
+        window_left,
+        kv_prefix_mode,
+        kv_lengths_mode,
+        max_active_clusters,
+    )
+    digest = hashlib.sha256(repr(codegen_key).encode()).hexdigest()
+    return f"{variant}_h{head_dim}_{digest}"
 
 
 @dataclass(frozen=True)
@@ -1582,64 +1645,103 @@ def _get_compiled_decode(
         k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
         v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    disk_name_args = (
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_kv_len,
+        seq_len_q,
+        q_dtype_key,
+        kv_dtype_key,
+        output_dtype_key,
+        kv_layout,
+        mask_type,
+        use_packed_q,
+        window_left,
+        kv_prefix_mode,
+        kv_lengths_mode,
+        max_active_clusters,
+    )
+    source_files = _decode_kernel_source_files()
 
     with torch.cuda.device(device_index):
-        compiled_main = cute.compile(
-            main_tensor_adapter,
-            q_fake,
-            k_fake,
-            v_fake,
-            k_sf_fake,
-            v_sf_fake,
-            out_fake,
-            seq_lens_fake,
-            cu_seqlens_q_fake,
-            indptr_fake,
-            indices_fake,
-            partial_o_fake,
-            partial_stats_fake,
-            counter_fake,
-            attention_sinks_fake,
-            Int64(1),
-            Int64(1),
-            Int64(1),
-            Float32(1.0),
-            Float32(1.0),
-            stream_fake,
-            cfg,
-            batch_size,
-            seq_len_q,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            max_kv_len,
-            max_active_clusters,
-            static_full_split_prefix,
-            static_native_uniform_kv,
-            options=_COMPILE_OPTIONS,
-        )
-        compiled_reducer = None
-        if cfg.use_separate_reduction_kernel:
-            assert reduction_tensor_adapter is not None
-            compiled_reducer = cute.compile(
-                reduction_tensor_adapter,
+        def compile_main():
+            return cute.compile(
+                main_tensor_adapter,
+                q_fake,
+                k_fake,
+                v_fake,
+                k_sf_fake,
+                v_sf_fake,
                 out_fake,
                 seq_lens_fake,
                 cu_seqlens_q_fake,
+                indptr_fake,
+                indices_fake,
                 partial_o_fake,
                 partial_stats_fake,
+                counter_fake,
                 attention_sinks_fake,
+                Int64(1),
+                Int64(1),
+                Int64(1),
                 Float32(1.0),
                 Float32(1.0),
                 stream_fake,
                 cfg,
                 batch_size,
+                seq_len_q,
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
                 max_kv_len,
+                max_active_clusters,
                 static_full_split_prefix,
+                static_native_uniform_kv,
                 options=_COMPILE_OPTIONS,
+            )
+
+        compiled_main = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_DECODE_MODULE,
+            _decode_kernel_disk_name("main", *disk_name_args),
+            compile_main,
+            extra_key_files=source_files,
+        )
+        compiled_reducer = None
+        if cfg.use_separate_reduction_kernel:
+            assert reduction_tensor_adapter is not None
+
+            def compile_reducer():
+                return cute.compile(
+                    reduction_tensor_adapter,
+                    out_fake,
+                    seq_lens_fake,
+                    cu_seqlens_q_fake,
+                    partial_o_fake,
+                    partial_stats_fake,
+                    attention_sinks_fake,
+                    Float32(1.0),
+                    Float32(1.0),
+                    stream_fake,
+                    cfg,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    max_kv_len,
+                    static_full_split_prefix,
+                    options=_COMPILE_OPTIONS,
+                )
+
+            compiled_reducer = build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_DECODE_MODULE,
+                _decode_kernel_disk_name("reducer", *disk_name_args),
+                compile_reducer,
+                extra_key_files=source_files,
             )
 
     policy = spec.policy + (
