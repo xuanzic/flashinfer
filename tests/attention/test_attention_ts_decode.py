@@ -2988,6 +2988,33 @@ def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_force_dynamic_plan_modes(monkeypatch):
+    """The AOT-stable mode suppresses both metadata specializations."""
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_FORCE_DYNAMIC_PLAN", "1")
+    case = _make_decode_case(
+        kv_lens=(256,),
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="combined",
+        mask_type="dense",
+        device="cuda",
+        seed=31104,
+    )
+    wrapper = _plan_case(case, max_kv_len=256)
+    policy = dict(wrapper._policy)
+    assert policy["kv_prefix_mode"] == "dynamic"
+    assert policy["kv_lengths_mode"] == "dynamic"
+    _assert_case_correct(_run_case(wrapper, case), case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
     """One replay reloads packed Q offsets, native CSR, K lengths, and page IDs."""
 

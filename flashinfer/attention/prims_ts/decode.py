@@ -20,6 +20,7 @@ import functools
 import hashlib
 import math
 import numbers
+import os
 from pathlib import Path
 import struct
 from typing import TYPE_CHECKING, Literal, Optional, Union
@@ -63,6 +64,17 @@ _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _CUTE_DSL_DECODE_MODULE = "prims_ts_decode"
 _WORKSPACE_ALIGNMENT = 256
 _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
+
+
+def _force_dynamic_plan_modes() -> bool:
+    """Return whether optional metadata specializations are disabled.
+
+    This opt-in mode keeps decode specialization keys independent of exact
+    request lengths.  It is intended for deployments that ship a bounded AOT
+    matrix and must not JIT ``planned_*`` variants with another CUDA toolkit.
+    """
+
+    return os.environ.get("FLASHINFER_PRIMS_TS_FORCE_DYNAMIC_PLAN", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -2475,12 +2487,17 @@ class BatchDecodePagedTSWrapper:
             window_left,
         )
         spec = _resolve_decode_launch_spec(*semantic_key)
-        static_full_split_prefix = _planned_full_split_prefix(
-            spec.config,
-            seq_lens_host,
-            seq_len_q=seq_len_q,
-            max_kv_len=exact_max_kv_len,
-            mask_type=mask_type,
+        force_dynamic_plan = _force_dynamic_plan_modes()
+        static_full_split_prefix = (
+            False
+            if force_dynamic_plan
+            else _planned_full_split_prefix(
+                spec.config,
+                seq_lens_host,
+                seq_len_q=seq_len_q,
+                max_kv_len=exact_max_kv_len,
+                mask_type=mask_type,
+            )
         )
         kv_prefix_mode = "planned_full" if static_full_split_prefix else "dynamic"
         # Keep native KV lengths explicit whenever the K domain ends in an
@@ -2505,7 +2522,7 @@ class BatchDecodePagedTSWrapper:
         )
         kv_lengths_mode = (
             "dynamic"
-            if requires_runtime_kv_lengths
+            if force_dynamic_plan or requires_runtime_kv_lengths
             else _planned_kv_lengths_mode(
                 seq_lens_host,
                 max_kv_len=exact_max_kv_len,
