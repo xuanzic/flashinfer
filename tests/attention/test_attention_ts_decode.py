@@ -310,8 +310,8 @@ def _fp8_decode_reference(
 
     if q.dtype != _FP8 or k_cache.dtype != _FP8 or v_cache.dtype != _FP8:
         raise ValueError("the FP8 reference requires E4M3 Q, K, and V")
-    if output_dtype not in (torch.float16, _FP8):
-        raise ValueError("FP8 FMHA decode supports float16 or E4M3 output")
+    if output_dtype not in (torch.float16, torch.bfloat16, _FP8):
+        raise ValueError("FP8 FMHA decode supports float16, bfloat16, or E4M3 output")
     if splits_kv <= 0 or num_insts_kv <= 0:
         raise ValueError("splits_kv and num_insts_kv must be positive")
 
@@ -1333,6 +1333,23 @@ def _assert_case_correct(output, case):
             f"match ratio {match_ratio} is below {threshold}"
         )
         return
+    elif (
+        case.q.dtype == _FP8
+        and case.k_cache.dtype == torch.uint8
+        and case.output_dtype == torch.bfloat16
+    ):
+        # The FP8-Q path quantizes softmax probabilities to E4M3 before BMM2.
+        # Check its native BF16 epilogue against that modeled stream without
+        # imposing the much tighter homogeneous-FP8/FP16-output envelope. A
+        # tiny number of long-KV lanes can exceed one 0.03125 step, so retain
+        # the same ratio-style oracle as FP8 output with a stricter threshold.
+        close = torch.isclose(actual, expected, rtol=1e-2, atol=3.125e-2)
+        match_ratio = close.float().mean()
+        threshold = 0.999
+        assert match_ratio > threshold, (
+            f"match ratio {match_ratio} is below {threshold}"
+        )
+        return
     elif case.output_dtype == _FP8:
         rtol, atol = 5e-2, 2e-3
     elif case.q.dtype == _FP8:
@@ -2264,6 +2281,7 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
         (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
         (torch.bfloat16, torch.uint8, torch.bfloat16),
         (torch.float8_e4m3fn, torch.uint8, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.uint8, torch.bfloat16),
     ),
 )
 def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):
@@ -2380,7 +2398,12 @@ def test_attention_ts_nvfp4_cache_contract():
 )
 @pytest.mark.parametrize(
     "qkv_dtype",
-    ["bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv"],
+    [
+        "bf16q-fp8kv",
+        "bf16q-nvfp4kv",
+        "fp8q-nvfp4kv",
+        "fp8q-nvfp4kv-bf16o",
+    ],
 )
 def test_attention_ts_decode_mixed_precision(
     batch_size: int,
@@ -2390,12 +2413,18 @@ def test_attention_ts_decode_mixed_precision(
     num_kv_heads: int,
     head_dim: int,
     page_size: int,
-    qkv_dtype: Literal["bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv"],
+    qkv_dtype: Literal[
+        "bf16q-fp8kv",
+        "bf16q-nvfp4kv",
+        "fp8q-nvfp4kv",
+        "fp8q-nvfp4kv-bf16o",
+    ],
 ):
     dtype_dict = {
         "bf16q-fp8kv": (torch.bfloat16, _FP8, torch.bfloat16),
         "bf16q-nvfp4kv": (torch.bfloat16, torch.uint8, torch.bfloat16),
         "fp8q-nvfp4kv": (_FP8, torch.uint8, _FP8),
+        "fp8q-nvfp4kv-bf16o": (_FP8, torch.uint8, torch.bfloat16),
     }
     q_dtype, kv_dtype, output_dtype = dtype_dict[qkv_dtype]
     case, kv_scale_factors = _make_mixed_precision_decode_case(

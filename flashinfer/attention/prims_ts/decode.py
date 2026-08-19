@@ -706,7 +706,12 @@ def _validate_dtype_pair(
         or (
             q_dtype == torch.float8_e4m3fn
             and kv_dtype in (torch.float8_e4m3fn, torch.uint8)
-            and output_dtype in (torch.float16, torch.float8_e4m3fn)
+            and output_dtype
+            in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            )
         )
     )
     if not supported:
