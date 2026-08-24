@@ -31,7 +31,7 @@ from typing import Callable
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32, Uint8, Uint32
+from cutlass import Int16, Int32, Uint8, Uint32
 
 from ...api_logging import flashinfer_api
 from ...cute_dsl.fp4_common import (
@@ -66,7 +66,7 @@ def _broadcast_low_byte(value: Int32) -> Int32:
 
 
 @cute.jit
-def _mul_packed_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
+def _mul_packed_e2m1x4_e4m3x4(packed_fp4: Int16, packed_sf: Int32) -> Int32:
     """Apply four E4M3 scales to four contiguous packed E2M1 nibbles."""
     if cutlass.const_expr(cutlass.target_version(min_version="13.4")):
         return cute.arch.inline_ptx(
@@ -82,10 +82,10 @@ def _mul_packed_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
         return cute.arch.inline_ptx(
             """
             {
-                .reg .b8 fp4_01, fp4_23, unused0, unused1;
+                .reg .b8 fp4_01, fp4_23;
                 .reg .b16 sf_01, sf_23, e4m3_01, e4m3_23;
                 .reg .b32 h_01, h_23, sf_h_01, sf_h_23;
-                mov.b32 {fp4_01, fp4_23, unused0, unused1}, {$r0};
+                mov.b16 {fp4_01, fp4_23}, {$r0};
                 mov.b32 {sf_01, sf_23}, {$r1};
                 cvt.rn.f16x2.e2m1x2 h_01, fp4_01;
                 cvt.rn.f16x2.e2m1x2 h_23, fp4_23;
@@ -159,16 +159,16 @@ class NVFP4DequantizeQmul4LinearKernel:
 
             packed_sf = _broadcast_low_byte(Int32(mScales[row_idx, block_idx]))
             out_0 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(packed_0 & Uint32(0xFFFF)), packed_sf
+                Int16(packed_0 & Uint32(0xFFFF)), packed_sf
             )
             out_1 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(packed_0 >> Int32(16)), packed_sf
+                Int16(packed_0 >> Int32(16)), packed_sf
             )
             out_2 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(packed_1 & Uint32(0xFFFF)), packed_sf
+                Int16(packed_1 & Uint32(0xFFFF)), packed_sf
             )
             out_3 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(packed_1 >> Int32(16)), packed_sf
+                Int16(packed_1 >> Int32(16)), packed_sf
             )
 
             row_output = mOutput[row_idx, None]
@@ -299,28 +299,28 @@ class NVFP4ActivePageMaterializeQmul4Kernel:
             )
 
             k_out_0 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(k_packed_0 & Uint32(0xFFFF)), k_sf
+                Int16(k_packed_0 & Uint32(0xFFFF)), k_sf
             )
             k_out_1 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(k_packed_0 >> Int32(16)), k_sf
+                Int16(k_packed_0 >> Int32(16)), k_sf
             )
             k_out_2 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(k_packed_1 & Uint32(0xFFFF)), k_sf
+                Int16(k_packed_1 & Uint32(0xFFFF)), k_sf
             )
             k_out_3 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(k_packed_1 >> Int32(16)), k_sf
+                Int16(k_packed_1 >> Int32(16)), k_sf
             )
             v_out_0 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(v_packed_0 & Uint32(0xFFFF)), v_sf
+                Int16(v_packed_0 & Uint32(0xFFFF)), v_sf
             )
             v_out_1 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(v_packed_0 >> Int32(16)), v_sf
+                Int16(v_packed_0 >> Int32(16)), v_sf
             )
             v_out_2 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(v_packed_1 & Uint32(0xFFFF)), v_sf
+                Int16(v_packed_1 & Uint32(0xFFFF)), v_sf
             )
             v_out_3 = _mul_packed_e2m1x4_e4m3x4(
-                Int32(v_packed_1 >> Int32(16)), v_sf
+                Int16(v_packed_1 >> Int32(16)), v_sf
             )
 
             output_byte = block_idx * Int32(_NVFP4_BLOCK_SIZE)
